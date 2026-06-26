@@ -50,3 +50,6 @@ __queuestorage__
 __tablestorage__/
 __azurite_db*__.json
 AzuriteConfig
+
+# HubSpot config file
+hubspot.config.yml

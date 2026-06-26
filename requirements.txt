@@ -3,3 +3,5 @@
 # azure-monitor-opentelemetry 
 
 azure-functions
+hubspot-api-client
+azure-storage-blob
