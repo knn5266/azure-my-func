@@ -187,3 +187,149 @@ def timerTrigger(myTimer: func.TimerRequest) -> None:
         logging.error(f"HubSpot APIエラー: {e}")
     except Exception as e:
         logging.error(f"エラー: {e}")
+
+
+def _run_company_batch_import():
+    import os
+    import json
+    import csv
+    import io
+    from datetime import datetime, timezone
+    from hubspot import HubSpot
+    from hubspot.crm.companies import SimplePublicObjectInputForCreate, SimplePublicObjectInput, ApiException
+    from hubspot.crm.companies import PublicObjectSearchRequest, Filter, FilterGroup
+    from azure.storage.blob import BlobServiceClient
+
+    logging.info("=== 会社一括インポートバッチ 開始 ===")
+    start_time = datetime.now(timezone.utc)
+
+    conn_str = os.environ.get("AzureWebJobsStorage")
+    token = os.environ.get("HUBSPOT_ACCESS_TOKEN")
+    api_client = HubSpot(access_token=token)
+    blob_service = BlobServiceClient.from_connection_string(conn_str)
+
+    created_count = 0
+    updated_count = 0
+    skipped_count = 0
+    error_count = 0
+    results = []
+
+    # Blob Storage から CSV 取得
+    container = blob_service.get_container_client("companies-import")
+    if not container.exists():
+        container.create_container()
+
+    blob_client = container.get_blob_client("companies.csv")
+    csv_data = blob_client.download_blob().readall().decode("utf-8-sig")
+    logging.info("CSV ファイル取得完了")
+
+    reader = csv.DictReader(io.StringIO(csv_data))
+    rows = list(reader)
+    logging.info(f"CSV レコード数: {len(rows)}")
+
+    for row in rows:
+        name = row.get("name", "").strip()
+        domain = row.get("domain", "").strip()
+        industry = row.get("industry", "").strip()
+        city = row.get("city", "").strip()
+        phone = row.get("phone", "").strip()
+
+        if not name:
+            logging.warning(f"name が空のためスキップ: {row}")
+            skipped_count += 1
+            continue
+
+        try:
+            # domain で既存会社を検索
+            search_request = PublicObjectSearchRequest(
+                filter_groups=[FilterGroup(filters=[
+                    Filter(property_name="domain", operator="EQ", value=domain)
+                ])],
+                properties=["name", "domain"]
+            )
+            search_result = api_client.crm.companies.search_api.do_search(
+                public_object_search_request=search_request
+            )
+
+            props = {
+                "name": name,
+                "domain": domain,
+                "industry": industry,
+                "city": city,
+                "phone": phone,
+            }
+
+            if search_result.total > 0:
+                # 既存 → 更新
+                company_id = search_result.results[0].id
+                update_input = SimplePublicObjectInput(properties=props)
+                api_client.crm.companies.basic_api.update(
+                    company_id=company_id,
+                    simple_public_object_input=update_input
+                )
+                logging.info(f"更新: {name} (id={company_id})")
+                updated_count += 1
+                results.append({"name": name, "status": "updated", "id": company_id})
+            else:
+                # 新規作成
+                create_input = SimplePublicObjectInputForCreate(properties=props)
+                created = api_client.crm.companies.basic_api.create(
+                    simple_public_object_input_for_create=create_input
+                )
+                logging.info(f"作成: {name} (id={created.id})")
+                created_count += 1
+                results.append({"name": name, "status": "created", "id": created.id})
+
+        except ApiException as e:
+            logging.error(f"HubSpot エラー ({name}): {e}")
+            error_count += 1
+            results.append({"name": name, "status": "error", "message": str(e)})
+
+    # 処理結果を Blob に保存
+    end_time = datetime.now(timezone.utc)
+    summary = {
+        "executed_at": start_time.isoformat(),
+        "duration_seconds": (end_time - start_time).seconds,
+        "total": len(rows),
+        "created": created_count,
+        "updated": updated_count,
+        "skipped": skipped_count,
+        "error": error_count,
+        "details": results,
+    }
+    result_blob_name = start_time.strftime("%Y-%m-%d_%H-%M-%S") + "_company_import_result.json"
+    result_container = blob_service.get_container_client("companies-import-results")
+    if not result_container.exists():
+        result_container.create_container()
+    result_container.upload_blob(result_blob_name, json.dumps(summary, ensure_ascii=False, default=str))
+
+    logging.info("=== 会社一括インポートバッチ 完了 ===")
+    logging.info(f"作成: {created_count}件 / 更新: {updated_count}件 / スキップ: {skipped_count}件 / エラー: {error_count}件")
+    logging.info(f"結果保存: {result_blob_name}")
+
+    return summary
+
+
+@app.timer_trigger(schedule="0 0 2 * * *", arg_name="batchTimer", run_on_startup=False, use_monitor=False)
+def companyBatchImport(batchTimer: func.TimerRequest) -> None:
+    try:
+        _run_company_batch_import()
+    except Exception as e:
+        logging.error(f"バッチ全体エラー: {e}")
+        raise
+
+
+@app.route(route="runCompanyBatch", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST"])
+def runCompanyBatchHttp(req: func.HttpRequest) -> func.HttpResponse:
+    import json
+    logging.info("会社一括インポートバッチ 手動実行")
+    try:
+        summary = _run_company_batch_import()
+        return func.HttpResponse(
+            json.dumps(summary, ensure_ascii=False, default=str),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.error(f"バッチ手動実行エラー: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
